@@ -23,12 +23,16 @@ import GHC.OverloadedLabels
 import GHC.TypeLits
 
 
+-- Schema representation
+
 type Database   = [Table]
 data Table      = TableName := [Column]
 data Column     = ColumnName ::: Type
 type TableName  = Symbol
 type ColumnName = Symbol
 
+
+-- Syntax of queries at type level
 
 data SelectQuery = Select [ResultColumn] TableExpr WhereClause
 
@@ -42,8 +46,10 @@ data ResultColumn = Star | Expr Expression AsClause
 
 type WhereClause  = Maybe Expression
 type AsClause     = Maybe ColumnName
-data Expression   = IntLit | StrLit | Col ColumnName | Equal Expression Expression
+data Expression   = IntLit | StrLit | Col ColumnName | QualCol TableName ColumnName | Equal Expression Expression
 
+
+-- General-purpose singletons
 
 data family Sing k :: k -> Type
 data instance Sing [k] xs where
@@ -55,6 +61,12 @@ data instance Sing (Maybe k) x where
   Just_    :: Sing k x -> Sing (Maybe k) (Just x)
 data instance Sing Symbol s where
   Symbol :: KnownSymbol s => Proxy# s -> Sing Symbol s
+
+instance (s ~ x, KnownSymbol s) => IsLabel x (Sing Symbol s) where
+  fromLabel = Symbol
+
+
+-- Singletons for representing queries at value level
 
 data instance Sing SelectQuery q where
   Select_ :: Sing [ResultColumn] rcs -> Sing TableExpr te -> Sing WhereClause wc
@@ -69,15 +81,15 @@ data instance Sing TableExpr te where
   LeftJoinUsing_ :: Sing TableExpr te1 -> Sing TableExpr te2 -> Sing [ColumnName] cols -> Sing TableExpr (LeftJoinUsing te1 te2 cols)
   As_ :: Sing TableExpr te -> Sing TableName t -> Sing TableExpr (As te t)
 data instance Sing Expression e where
-  IntLit_ :: Int -> Sing Expression IntLit
-  StrLit_ :: String -> Sing Expression StrLit
-  Col_    :: Sing ColumnName c -> Sing Expression (Col c)
-  Equal_  :: Sing Expression e1 -> Sing Expression e2 -> Sing Expression (Equal e1 e2)
+  IntLit_  :: Int -> Sing Expression IntLit
+  StrLit_  :: String -> Sing Expression StrLit
+  Col_     :: Sing ColumnName c -> Sing Expression (Col c)
+  QualCol_ :: Sing TableName t -> Sing ColumnName c -> Sing Expression (QualCol t c)
+  Equal_   :: Sing Expression e1 -> Sing Expression e2 -> Sing Expression (Equal e1 e2)
 
 
-instance (s ~ x, KnownSymbol s) => IsLabel x (Sing Symbol s) where
-  fromLabel = Symbol
-
+-- Converting singleton queries back to strings
+-- (perhaps this should go to simply 'k'?)
 
 class ToQuery k where
   toQuery :: Sing k e -> String
@@ -101,7 +113,7 @@ instance ToQuery SelectQuery where
 instance ToQuery TableExpr where
   toQuery (From_ t) = toQuery t
   toQuery (CrossJoin_ te1 te2) = toQuery te1 ++ " CROSS JOIN " ++ toQuery te2
-  toQuery (LeftJoinOn_ te1 te2 e) = toQuery te1 ++ " LEFT OUTER JOIN" ++ toQuery te2 ++ " ON " ++ toQuery e
+  toQuery (LeftJoinOn_ te1 te2 e) = toQuery te1 ++ " LEFT OUTER JOIN " ++ toQuery te2 ++ " ON " ++ toQuery e
   toQuery (LeftJoinUsing_ te1 te2 cols) = toQuery te1 ++ " LEFT OUTER JOIN " ++ toQuery te2 ++ " USING " ++ toQuery cols
   toQuery (As_ te t) = toQuery te ++ " AS " ++ toQuery t
 
@@ -113,9 +125,12 @@ instance ToQuery Expression where
   toQuery (IntLit_ k) = show k
   toQuery (StrLit_ s) = show s
   toQuery (Col_ c)    = toQuery c
+  toQuery (QualCol_ t c) = toQuery t ++ "." ++ toQuery c
   toQuery (Equal_ e1 e2) = toQuery e1 ++ " == " ++ toQuery e2
 
 
+
+-- Misc type family utilities
 
 type family If b x y where
   If True x _ = x
@@ -130,6 +145,15 @@ type family (++) xs ys where
   '[] ++ ys = ys
   (x ': xs) ++ ys = x ': (xs ++ ys)
 
+type family All (c :: k -> Constraint) (xs :: [k]) :: Constraint where
+  All c '[] = ()
+  All c (x ': xs) = (c x, All c xs)
+
+class g (f x) => (g `O` f) x
+instance g (f x) => (g `O` f) x
+
+
+-- Calculating the result columns for queries
 
 type family QueryColumnsDB (db :: Database) (q :: SelectQuery) :: [Column] where
   QueryColumnsDB db (Select rcs te _wc) = LookupResultColumns rcs (ExpandTableExpr db te)
@@ -153,11 +177,13 @@ type family ExprName e where
   ExprName IntLit = "" -- ?
   ExprName StrLit = "" -- ?
   ExprName (Col c) = c
+  ExprName (QualCol _ c) = c
 
 type family ExprType e cols where
   ExprType IntLit  _     = Int
   ExprType StrLit  _     = String
   ExprType (Col c) cols  = LookupColumn c cols
+  ExprType (QualCol _ c) cols = LookupColumn c cols -- TODO
   ExprType (Equal e1 e2) _ = Bool
 
 type family LookupTable (table :: TableName) (db :: Database) :: [Column] where
@@ -180,6 +206,7 @@ type family FilterColumns (colnames :: [ColumnName]) (cols :: [Column]) :: [Colu
                                                         ((colname ::: ty) ': FilterColumns colnames cols)
 
 
+-- Checking validity of queries
 
 type family ValidQuery (db :: Database) (q :: SelectQuery) :: Constraint where
   ValidQuery db (Select rcs t wc) = (ValidTableExpr db t, ValidWhere wc (QueryColumnsDB db (Select rcs t wc)))
@@ -199,6 +226,7 @@ type family ValidExpr (e :: Expression) (cols :: [Column])  :: Constraint where
   ValidExpr IntLit  _ = ()
   ValidExpr StrLit  _ = ()
   ValidExpr (Col c) cols = ValidCol c cols
+  ValidExpr (QualCol _ c) cols = ValidCol c cols -- TODO
   ValidExpr (Equal e1 e2) cols = (ValidExpr e1 cols, ValidExpr e2 cols, ExprType e1 cols ~ ExprType e2 cols)
 
 type family ValidCols (colnames :: [ColumnName]) (cols :: [Column]) :: Constraint where
@@ -216,13 +244,7 @@ type family ValidTableName (t :: TableName) (tables :: [Table])  :: Constraint w
   ValidTableName t (_ ': tables) = ValidTableName t tables
 
 
-type family All (c :: k -> Constraint) (xs :: [k]) :: Constraint where
-  All c '[] = ()
-  All c (x ': xs) = (c x, All c xs)
-
-class g (f x) => (g `O` f) x
-instance g (f x) => (g `O` f) x
-
+-- Anonymous records
 
 type family ColumnType c where
   ColumnType (_ ::: ty) = ty
@@ -235,6 +257,9 @@ data Record (cols :: [Column]) where
   Cons :: a -> Record cols -> Record ((colname ::: a) ': cols)
 deriving instance All ShowColumn cols => Show (Record cols)
 
+
+-- Fake wrapper monad for issuing queries
+
 newtype Db (db :: Database) a = Db { runDb :: a }
   deriving Show
 
@@ -242,6 +267,8 @@ select :: forall db q . ValidQuery db q => Sing SelectQuery q -> Db db [Record (
 select s = error (toQuery s)
 
 
+
+-- Examples
 
 type ExampleQuery = Select '[ Expr (Col "name") {- AS -} (Just "foo")
                             , Expr IntLit Nothing
@@ -256,15 +283,21 @@ e1 = Select_ (Expr_ (Col_ #name) (Just_ #foo) :> Expr_ (IntLit_ 5) Nothing_ :> S
             (Just_ (Col_ #foo `Equal_` StrLit_ "moo"))
 
 e2 = Select_ (Star_ :> Nil_)
-             (LeftJoinOn_ (From_ #posts) (From_ #users `As_` #blah) (Col_ #user_id `Equal_` Col_ #user_id))
+             (LeftJoinOn_ (From_ #posts) (From_ #users `As_` #blah) (QualCol_ #foo #user_id `Equal_` QualCol_ #posts #user_id))
+             Nothing_
+
+e3 = Select_ (Expr_ (QualCol_ #foo #baf) Nothing_ :> Nil_)
+             ((From_ #users `As_` #bar) `CrossJoin_` (From_ #posts `As_` #foo))
              Nothing_
 
 type MySchema = '[ "users" := '[ "user_id" ::: Int
                                , "name"    ::: String
+                               , "baf"     ::: Bool
                                ]
                  , "posts" := '[ "post_id" ::: Int
                                , "user_id" ::: Int
                                , "message" ::: String
+                               , "baf"     ::: Int
                                ]
                  ]
 
