@@ -37,10 +37,9 @@ type ColumnName = Symbol
 data SelectQuery = Select [ResultColumn] TableExpr WhereClause
 
 data TableExpr = From TableName
-               | CrossJoin TableExpr TableExpr
-               | LeftJoinOn TableExpr TableExpr Expression
-               | LeftJoinUsing TableExpr TableExpr [ColumnName]
+               | Join TableExpr TableExpr JoinType
                | As TableExpr TableName
+data JoinType = Cross | On Expression | Using [ColumnName]
 
 data ResultColumn = Star | Expr Expression AsClause
 
@@ -76,10 +75,12 @@ data instance Sing ResultColumn rc where
   Expr_ :: Sing Expression e -> Sing AsClause a -> Sing ResultColumn (Expr e a)
 data instance Sing TableExpr te where
   From_ :: Sing TableName t -> Sing TableExpr (From t)
-  CrossJoin_ :: Sing TableExpr te1 -> Sing TableExpr te2 -> Sing TableExpr (CrossJoin te1 te2)
-  LeftJoinOn_ :: Sing TableExpr te1 -> Sing TableExpr te2 -> Sing Expression e -> Sing TableExpr (LeftJoinOn te1 te2 e)
-  LeftJoinUsing_ :: Sing TableExpr te1 -> Sing TableExpr te2 -> Sing [ColumnName] cols -> Sing TableExpr (LeftJoinUsing te1 te2 cols)
+  Join_ :: Sing TableExpr te1 -> Sing TableExpr te2 -> Sing JoinType j -> Sing TableExpr (Join te1 te2 j)
   As_ :: Sing TableExpr te -> Sing TableName t -> Sing TableExpr (As te t)
+data instance Sing JoinType j where
+  Cross_ :: Sing JoinType Cross
+  On_    :: Sing Expression e -> Sing JoinType (On e)
+  Using_ :: Sing [ColumnName] cols -> Sing JoinType (Using cols)
 data instance Sing Expression e where
   IntLit_  :: Int -> Sing Expression IntLit
   StrLit_  :: String -> Sing Expression StrLit
@@ -112,9 +113,10 @@ instance ToQuery SelectQuery where
 
 instance ToQuery TableExpr where
   toQuery (From_ t) = toQuery t
-  toQuery (CrossJoin_ te1 te2) = toQuery te1 ++ " CROSS JOIN " ++ toQuery te2
-  toQuery (LeftJoinOn_ te1 te2 e) = toQuery te1 ++ " LEFT OUTER JOIN " ++ toQuery te2 ++ " ON " ++ toQuery e
-  toQuery (LeftJoinUsing_ te1 te2 cols) = toQuery te1 ++ " LEFT OUTER JOIN " ++ toQuery te2 ++ " USING " ++ toQuery cols
+  toQuery (Join_ te1 te2 j) = case j of
+    Cross_      -> toQuery te1 ++ " CROSS JOIN "      ++ toQuery te2
+    On_ e       -> toQuery te1 ++ " LEFT OUTER JOIN " ++ toQuery te2 ++ " ON " ++ toQuery e
+    Using_ cols -> toQuery te1 ++ " LEFT OUTER JOIN " ++ toQuery te2 ++ " USING " ++ toQuery cols
   toQuery (As_ te t) = toQuery te ++ " AS " ++ toQuery t
 
 instance ToQuery ResultColumn where
@@ -160,11 +162,10 @@ type family QueryColumnsDB (db :: Database) (q :: SelectQuery) :: [Column] where
 
 type family ExpandTableExpr (db :: Database) (te :: TableExpr) :: [Column] where
   ExpandTableExpr db (From t) = LookupTable t db
-  ExpandTableExpr db (CrossJoin te1 te2) = ExpandTableExpr db te1 ++ ExpandTableExpr db te2
-  ExpandTableExpr db (LeftJoinOn te1 te2 e)       = ExpandTableExpr db te1 ++ ExpandTableExpr db te2
-  ExpandTableExpr db (LeftJoinUsing te1 te2 cols) = LookupColumns cols (ExpandTableExpr db te1)
-                                                 ++ FilterColumns cols (ExpandTableExpr db te1)
-                                                 ++ FilterColumns cols (ExpandTableExpr db te2)
+  ExpandTableExpr db (Join te1 te2 (Using cols)) = LookupColumns cols (ExpandTableExpr db te1)
+                                                ++ FilterColumns cols (ExpandTableExpr db te1)
+                                                ++ FilterColumns cols (ExpandTableExpr db te2)
+  ExpandTableExpr db (Join te1 te2 _) = ExpandTableExpr db te1 ++ ExpandTableExpr db te2
   ExpandTableExpr db (As te t) = ExpandTableExpr db te -- TODO
 
 type family LookupResultColumns (rcs :: [ResultColumn]) (cols :: [Column]) :: [Column] where
@@ -213,10 +214,13 @@ type family ValidQuery (db :: Database) (q :: SelectQuery) :: Constraint where
 
 type family ValidTableExpr db t where
   ValidTableExpr db (From t) = ValidTableName t db
-  ValidTableExpr db (CrossJoin te1 te2) = (ValidTableExpr db te1, ValidTableExpr db te2)
-  ValidTableExpr db (LeftJoinOn te1 te2 e) = (ValidTableExpr db te1, ValidTableExpr db te2, ExprType e (ExpandTableExpr db (LeftJoinOn te1 te2 e)) ~ Bool)
-  ValidTableExpr db (LeftJoinUsing te1 te2 cols) = (ValidTableExpr db te1, ValidTableExpr db te2, ValidCols cols (ExpandTableExpr db te1), ValidCols cols (ExpandTableExpr db te2))
+  ValidTableExpr db (Join te1 te2 j) = (ValidTableExpr db te1, ValidTableExpr db te2, ValidJoin db te1 te2 j)
   ValidTableExpr db (As te t) = ValidTableExpr db te
+
+type family ValidJoin db te1 te2 j :: Constraint where
+  ValidJoin db te1 te2 Cross        = ()
+  ValidJoin db te1 te2 (On e)       = ExprType e (ExpandTableExpr db (Join te1 te2 (On e))) ~ Bool
+  ValidJoin db te1 te2 (Using cols) = (ValidCols cols (ExpandTableExpr db te1), ValidCols cols (ExpandTableExpr db te2))
 
 type family ValidWhere (wc :: WhereClause) (cols :: [Column])  :: Constraint where
   ValidWhere Nothing cols = ()
@@ -274,20 +278,21 @@ type ExampleQuery = Select '[ Expr (Col "name") {- AS -} (Just "foo")
                             , Expr IntLit Nothing
                             , Star
                             ]
-                            (LeftJoinUsing (From "users") (From "posts") '["user_id"])
+                            (Join (From "users") (From "posts") (Using '["user_id"]))
                    {- WHERE -} (Just (Col "foo" `Equal` StrLit))
 
 e1 :: Sing SelectQuery ExampleQuery
 e1 = Select_ (Expr_ (Col_ #name) (Just_ #foo) :> Expr_ (IntLit_ 5) Nothing_ :> Star_ :> Nil_)
-            (LeftJoinUsing_ (From_ #users) (From_ #posts) (#user_id :> Nil_))
+            (Join_ (From_ #users) (From_ #posts) (Using_ (#user_id :> Nil_)))
             (Just_ (Col_ #foo `Equal_` StrLit_ "moo"))
 
 e2 = Select_ (Star_ :> Nil_)
-             (LeftJoinOn_ (From_ #posts) (From_ #users `As_` #blah) (QualCol_ #foo #user_id `Equal_` QualCol_ #posts #user_id))
+             (Join_ (From_ #posts) (From_ #users `As_` #blah)
+                    (On_ (QualCol_ #foo #user_id `Equal_` QualCol_ #posts #user_id)))
              Nothing_
 
 e3 = Select_ (Expr_ (QualCol_ #foo #baf) Nothing_ :> Nil_)
-             ((From_ #users `As_` #bar) `CrossJoin_` (From_ #posts `As_` #foo))
+             (Join_ (From_ #users `As_` #bar) (From_ #posts `As_` #foo) Cross_)
              Nothing_
 
 type MySchema = '[ "users" := '[ "user_id" ::: Int
