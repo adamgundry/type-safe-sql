@@ -90,7 +90,10 @@ data instance Sing Expression e where
 
 
 -- Converting singleton queries back to strings
--- (perhaps this should go to simply 'k'?)
+
+-- It would be nice to have a general operation
+--   demote :: Sing k e -> k
+-- but the Symbol/String difference makes that mildly awkward
 
 class ToQuery k where
   toQuery :: Sing k e -> String
@@ -156,6 +159,9 @@ instance g (f x) => (g `O` f) x
 
 
 -- Calculating the result columns for queries
+
+-- We ought to pass table names around more here, so we can properly
+-- support duplicate column names across multiple tables.
 
 type family QueryColumnsDB (db :: Database) (q :: SelectQuery) :: [Column] where
   QueryColumnsDB db (Select rcs te _wc) = LookupResultColumns rcs (ExpandTableExpr db te)
