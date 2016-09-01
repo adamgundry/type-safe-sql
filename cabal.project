@@ -1,0 +1,3 @@
+packages: type-safe-sql.cabal
+with-compiler: ghc-8.0.1
+constraints: postgresql-libpq == 0.9.1.1

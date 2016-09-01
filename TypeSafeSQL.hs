@@ -5,7 +5,9 @@
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedLabels #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
@@ -17,10 +19,17 @@
 
 module TypeSafeSQL where
 
+import qualified Data.ByteString as BS
+import qualified Database.PostgreSQL.Simple as PG
+import qualified Database.PostgreSQL.Simple.FromRow as PG
+import qualified Database.PostgreSQL.Simple.FromField as PG
+
 import Data.Kind (Type, Constraint)
+import Data.String
 import GHC.Exts (Proxy#, proxy#)
 import GHC.OverloadedLabels
 import GHC.TypeLits
+import Unsafe.Coerce
 
 
 -- Schema representation
@@ -65,6 +74,14 @@ instance (s ~ x, KnownSymbol s) => IsLabel x (Sing Symbol s) where
   fromLabel = Symbol
 
 
+-- Singletons for schema
+
+data instance Sing Table t where
+  (:==) :: Sing TableName tname -> Sing [Column] cols -> Sing Table (tname := cols)
+data instance Sing Column x where
+  Column_ :: Sing ColumnName colname -> Sing Column (colname ::: ty)
+
+
 -- Singletons for representing queries at value level
 
 data instance Sing SelectQuery q where
@@ -87,6 +104,29 @@ data instance Sing Expression e where
   Col_     :: Sing ColumnName c -> Sing Expression (Col c)
   QualCol_ :: Sing TableName t -> Sing ColumnName c -> Sing Expression (QualCol t c)
   Equal_   :: Sing Expression e1 -> Sing Expression e2 -> Sing Expression (Equal e1 e2)
+
+
+-- Implicit singletons
+
+class SingI k (x :: k) where
+  sing :: Sing k x
+
+newtype T k (x :: k) t = MkT (SingI k x => t)
+
+withSing :: forall k x t . Sing k x -> (SingI k x => t) -> t
+withSing d f = unsafeCoerce (MkT @k @x @t f) d
+
+instance SingI [k] '[] where
+  sing = Nil_
+
+instance (SingI k x, SingI [k] xs) => SingI [k] (x ': xs) where
+  sing = sing :> sing
+
+instance KnownSymbol s => SingI Symbol s where
+  sing = Symbol proxy#
+
+instance (SingI ColumnName colname) => SingI Column (colname ::: ty) where
+  sing = Column_ sing
 
 
 -- Converting singleton queries back to strings
@@ -112,14 +152,14 @@ instance ToQuery k => ToQuery [k] where
 
 instance ToQuery SelectQuery where
   toQuery (Select_ rcs t mb_w) =
-      "SELECT (" ++ toQuery rcs ++ ") FROM " ++ toQuery t ++ maybeToQuery "WHERE" mb_w
+      "SELECT " ++ toQuery rcs ++ " FROM " ++ toQuery t ++ maybeToQuery "WHERE" mb_w
 
 instance ToQuery TableExpr where
   toQuery (From_ t) = toQuery t
   toQuery (Join_ te1 te2 j) = case j of
     Cross_      -> toQuery te1 ++ " CROSS JOIN "      ++ toQuery te2
     On_ e       -> toQuery te1 ++ " LEFT OUTER JOIN " ++ toQuery te2 ++ " ON " ++ toQuery e
-    Using_ cols -> toQuery te1 ++ " LEFT OUTER JOIN " ++ toQuery te2 ++ " USING " ++ toQuery cols
+    Using_ cols -> toQuery te1 ++ " LEFT OUTER JOIN " ++ toQuery te2 ++ " USING (" ++ toQuery cols ++ ")"
   toQuery (As_ te t) = toQuery te ++ " AS " ++ toQuery t
 
 instance ToQuery ResultColumn where
@@ -128,10 +168,10 @@ instance ToQuery ResultColumn where
 
 instance ToQuery Expression where
   toQuery (IntLit_ k) = show k
-  toQuery (StrLit_ s) = show s
+  toQuery (StrLit_ s) = "'" ++ s ++ "'"
   toQuery (Col_ c)    = toQuery c
   toQuery (QualCol_ t c) = toQuery t ++ "." ++ toQuery c
-  toQuery (Equal_ e1 e2) = toQuery e1 ++ " == " ++ toQuery e2
+  toQuery (Equal_ e1 e2) = toQuery e1 ++ " = " ++ toQuery e2
 
 
 
@@ -256,6 +296,10 @@ type family ValidTableName (t :: TableName) (tables :: [Table])  :: Constraint w
 
 -- Anonymous records
 
+type family AllColumnTypes (c :: Type -> Constraint) (xs :: [Column]) :: Constraint where
+  AllColumnTypes c '[] = ()
+  AllColumnTypes c ((_ ::: ty) ': xs) = (c ty, AllColumnTypes c xs)
+
 type family ColumnType c where
   ColumnType (_ ::: ty) = ty
 
@@ -265,16 +309,25 @@ instance Show (ColumnType c) => ShowColumn (c :: Column)
 data Record (cols :: [Column]) where
   Nil  :: Record '[]
   Cons :: a -> Record cols -> Record ((colname ::: a) ': cols)
-deriving instance All ShowColumn cols => Show (Record cols)
+deriving instance AllColumnTypes Show cols => Show (Record cols)
+
+instance (SingI [Column] cols, AllColumnTypes PG.FromField cols) => PG.FromRow (Record cols) where
+  fromRow = case sing :: Sing [Column] cols of
+              Nil_            -> pure Nil
+              Column_ _ :> xs -> Cons <$> PG.field <*> withSing xs PG.fromRow
 
 
 -- Fake wrapper monad for issuing queries
 
-newtype Db (db :: Database) a = Db { runDb :: a }
-  deriving Show
+newtype Db (db :: Database) a = Db { unDb :: PG.Connection -> IO a }
 
-select :: forall db q . ValidQuery db q => Sing SelectQuery q -> Db db [Record (QueryColumnsDB db q)]
-select s = error (toQuery s)
+runDb :: Db db a -> IO a
+runDb db = do conn <- PG.connectPostgreSQL "host='localhost' dbname='mydatabase' password='womblewomble'"
+              unDb db conn <* PG.close conn
+
+select :: forall db q cols . (ValidQuery db q, cols ~ QueryColumnsDB db q, AllColumnTypes PG.FromField cols, SingI [Column] cols) => Sing SelectQuery q -> Db db [Record (QueryColumnsDB db q)]
+select s = Db $ \ conn -> do print (toQuery s)
+                             PG.query_ conn (fromString (toQuery s))
 
 
 
@@ -285,16 +338,18 @@ type ExampleQuery = Select '[ Expr (Col "name") {- AS -} (Just "foo")
                             , Star
                             ]
                             (Join (From "users") (From "posts") (Using '["user_id"]))
-                   {- WHERE -} (Just (Col "foo" `Equal` StrLit))
+                   {- WHERE -} (Just (Col "name" `Equal` StrLit))
+
+e0 = Select_ (Star_ :> Nil_) (From_ #users) Nothing_
 
 e1 :: Sing SelectQuery ExampleQuery
 e1 = Select_ (Expr_ (Col_ #name) (Just_ #foo) :> Expr_ (IntLit_ 5) Nothing_ :> Star_ :> Nil_)
             (Join_ (From_ #users) (From_ #posts) (Using_ (#user_id :> Nil_)))
-            (Just_ (Col_ #foo `Equal_` StrLit_ "moo"))
+            (Just_ (Col_ #name `Equal_` StrLit_ "moo"))
 
 e2 = Select_ (Star_ :> Nil_)
              (Join_ (From_ #posts) (From_ #users `As_` #blah)
-                    (On_ (QualCol_ #foo #user_id `Equal_` QualCol_ #posts #user_id)))
+                    (On_ (QualCol_ #blah #user_id `Equal_` QualCol_ #posts #user_id)))
              Nothing_
 
 e3 = Select_ (Expr_ (QualCol_ #foo #baf) Nothing_ :> Nil_)
@@ -314,4 +369,11 @@ type MySchema = '[ "users" := '[ "user_id" ::: Int
 
 type Example = QueryColumnsDB MySchema ExampleQuery
 
-blah = select @MySchema e1
+
+go e = runDb (select @MySchema e)
+
+main :: IO ()
+main = do print =<< go e0
+          print =<< go e1
+          print =<< go e2
+          print =<< go e3
