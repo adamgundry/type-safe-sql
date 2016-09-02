@@ -23,6 +23,8 @@ import qualified Data.ByteString as BS
 import qualified Database.PostgreSQL.Simple as PG
 import qualified Database.PostgreSQL.Simple.FromRow as PG
 import qualified Database.PostgreSQL.Simple.FromField as PG
+import qualified Database.PostgreSQL.Simple.ToRow as PG
+import qualified Database.PostgreSQL.Simple.ToField as PG
 
 import Data.Kind (Type, Constraint)
 import Data.String
@@ -54,7 +56,82 @@ data ResultColumn = Star | Expr Expression AsClause
 
 type WhereClause  = Maybe Expression
 type AsClause     = Maybe ColumnName
-data Expression   = IntLit | StrLit | Col ColumnName | QualCol TableName ColumnName | Equal Expression Expression
+data Expression   = Param Symbol Type | IntLit Nat | StrLit Symbol | Col ColumnName | QualCol TableName ColumnName | Equal Expression Expression
+
+
+type family Params (q :: k) :: [Column] where
+  Params '[]                  = '[]
+  Params (x:xs)               = Params x ++ Params xs
+  Params Nothing              = '[]
+  Params (Just x)             = Params x
+  Params (Select rcs te mb_w) = Params rcs ++ Params te ++ Params mb_w
+  Params (From _)             = '[]
+  Params (Join te1 te2 j)     = Params te1 ++ Params te2 ++ Params j
+  Params (As te _)            = Params te
+  Params Cross                = '[]
+  Params (On e)               = Params e
+  Params (Using _)            = '[]
+  Params Star                 = '[]
+  Params (Expr e _)           = Params e
+  Params (Param s ty)         = '[s ::: ty]
+  Params (IntLit _)           = '[]
+  Params (StrLit _)           = '[]
+  Params (Col _)              = '[]
+  Params (QualCol _ _)        = '[]
+  Params (Equal e1 e2)        = Params e1 ++ Params e2
+
+
+
+stringToSymbol :: String -> Symbol
+stringToSymbol = unsafeCoerce
+
+symbolToString :: Symbol -> String
+symbolToString = unsafeCoerce
+
+integerToNat :: Integer -> Nat
+integerToNat = unsafeCoerce
+
+natToInteger :: Nat -> Integer
+natToInteger = unsafeCoerce
+
+
+class ToQuery q where
+  toQuery :: q -> String
+
+maybeToQuery :: ToQuery k => String -> Maybe k -> String
+maybeToQuery _ Nothing = ""
+maybeToQuery s (Just x) = " " ++ s ++ " " ++ toQuery x
+
+instance ToQuery a => ToQuery [a] where
+  toQuery [] = ""
+  toQuery [x] = toQuery x
+  toQuery (x:xs) = toQuery x ++ ", " ++ toQuery xs
+
+instance ToQuery Symbol where
+  toQuery = symbolToString
+
+instance ToQuery SelectQuery where
+  toQuery (Select rcs te mb_w) = "SELECT " ++ toQuery rcs ++ " FROM " ++ toQuery te ++ maybeToQuery "WHERE" mb_w
+
+instance ToQuery TableExpr where
+  toQuery (From t) = toQuery t
+  toQuery (Join te1 te2 j) = case j of
+    Cross      -> toQuery te1 ++ " CROSS JOIN "      ++ toQuery te2
+    On e       -> toQuery te1 ++ " LEFT OUTER JOIN " ++ toQuery te2 ++ " ON " ++ toQuery e
+    Using cols -> toQuery te1 ++ " LEFT OUTER JOIN " ++ toQuery te2 ++ " USING (" ++ toQuery cols ++ ")"
+  toQuery (As te t) = toQuery te ++ " AS " ++ toQuery t
+
+instance ToQuery ResultColumn where
+  toQuery Star = "*"
+  toQuery (Expr e mb_a) = toQuery e ++ maybeToQuery "AS" mb_a
+
+instance ToQuery Expression where
+  toQuery (Param _ _)   = "?"
+  toQuery (IntLit i)    = show (natToInteger i)
+  toQuery (StrLit s)    = "'" ++ symbolToString s ++ "'"
+  toQuery (Col c)       = toQuery c
+  toQuery (QualCol t c) = toQuery t ++ "." ++ toQuery c
+  toQuery (Equal e1 e2) = toQuery e1 ++ " = " ++ toQuery e2
 
 
 -- General-purpose singletons
@@ -69,6 +146,10 @@ data instance Sing (Maybe k) x where
   Just_    :: Sing k x -> Sing (Maybe k) (Just x)
 data instance Sing Symbol s where
   Symbol :: KnownSymbol s => Proxy# s -> Sing Symbol s
+data instance Sing Nat n where
+  Nat :: KnownNat n => Proxy# n -> Sing Nat n
+data instance Sing Type ty where
+  Type_ :: Type -> Sing Type ty
 
 instance (s ~ x, KnownSymbol s) => IsLabel x (Sing Symbol s) where
   fromLabel = Symbol
@@ -99,8 +180,9 @@ data instance Sing JoinType j where
   On_    :: Sing Expression e -> Sing JoinType (On e)
   Using_ :: Sing [ColumnName] cols -> Sing JoinType (Using cols)
 data instance Sing Expression e where
-  IntLit_  :: Int -> Sing Expression IntLit
-  StrLit_  :: String -> Sing Expression StrLit
+  Param_   :: Sing Symbol s -> Sing Type ty -> Sing Expression (Param s ty)
+  IntLit_  :: Sing Nat i -> Sing Expression (IntLit i)
+  StrLit_  :: Sing Symbol s -> Sing Expression (StrLit s)
   Col_     :: Sing ColumnName c -> Sing Expression (Col c)
   QualCol_ :: Sing TableName t -> Sing ColumnName c -> Sing Expression (QualCol t c)
   Equal_   :: Sing Expression e1 -> Sing Expression e2 -> Sing Expression (Equal e1 e2)
@@ -125,53 +207,59 @@ instance (SingI k x, SingI [k] xs) => SingI [k] (x ': xs) where
 instance KnownSymbol s => SingI Symbol s where
   sing = Symbol proxy#
 
+instance KnownNat n => SingI Nat n where
+  sing = Nat proxy#
+
 instance (SingI ColumnName colname) => SingI Column (colname ::: ty) where
   sing = Column_ sing
 
 
 -- Converting singleton queries back to strings
 
--- It would be nice to have a general operation
---   demote :: Sing k e -> k
--- but the Symbol/String difference makes that mildly awkward
+class Demote k where
+  demote :: Sing k e -> k
 
-class ToQuery k where
-  toQuery :: Sing k e -> String
+instance Demote Symbol where
+  demote (Symbol p) = stringToSymbol (symbolVal' p)
 
-instance ToQuery Symbol where
-  toQuery (Symbol p) = symbolVal' p
+instance Demote Nat where
+  demote (Nat p) = integerToNat (natVal' p)
 
-maybeToQuery :: ToQuery k => String -> Sing (Maybe k) x -> String
-maybeToQuery _ Nothing_ = ""
-maybeToQuery s (Just_ x) = " " ++ s ++ " " ++ toQuery x
+instance Demote Type where
+  demote (Type_ t) = t
 
-instance ToQuery k => ToQuery [k] where
-  toQuery Nil_        = ""
-  toQuery (x :> Nil_) = toQuery x
-  toQuery (x :> xs)   = toQuery x ++ ", " ++ toQuery xs
+instance Demote k => Demote (Maybe k) where
+  demote Nothing_ = Nothing
+  demote (Just_ x) = Just (demote x)
 
-instance ToQuery SelectQuery where
-  toQuery (Select_ rcs t mb_w) =
-      "SELECT " ++ toQuery rcs ++ " FROM " ++ toQuery t ++ maybeToQuery "WHERE" mb_w
+instance Demote k => Demote [k] where
+  demote Nil_        = []
+  demote (x :> xs)   = demote x : demote xs
 
-instance ToQuery TableExpr where
-  toQuery (From_ t) = toQuery t
-  toQuery (Join_ te1 te2 j) = case j of
-    Cross_      -> toQuery te1 ++ " CROSS JOIN "      ++ toQuery te2
-    On_ e       -> toQuery te1 ++ " LEFT OUTER JOIN " ++ toQuery te2 ++ " ON " ++ toQuery e
-    Using_ cols -> toQuery te1 ++ " LEFT OUTER JOIN " ++ toQuery te2 ++ " USING (" ++ toQuery cols ++ ")"
-  toQuery (As_ te t) = toQuery te ++ " AS " ++ toQuery t
+instance Demote SelectQuery where
+  demote (Select_ rcs t mb_w) = Select (demote rcs) (demote t) (demote mb_w)
 
-instance ToQuery ResultColumn where
-  toQuery Star_ = "*"
-  toQuery (Expr_ e mb_a) = toQuery e ++ maybeToQuery "AS" mb_a
+instance Demote TableExpr where
+  demote (From_ t) = From (demote t)
+  demote (Join_ te1 te2 j) = Join (demote te1) (demote te2) (demote j)
+  demote (As_ te t) = As (demote te) (demote t)
 
-instance ToQuery Expression where
-  toQuery (IntLit_ k) = show k
-  toQuery (StrLit_ s) = "'" ++ s ++ "'"
-  toQuery (Col_ c)    = toQuery c
-  toQuery (QualCol_ t c) = toQuery t ++ "." ++ toQuery c
-  toQuery (Equal_ e1 e2) = toQuery e1 ++ " = " ++ toQuery e2
+instance Demote JoinType where
+  demote Cross_ = Cross
+  demote (On_ e) = On (demote e)
+  demote (Using_ cols) = Using (demote cols)
+
+instance Demote ResultColumn where
+  demote Star_ = Star -- "*"
+  demote (Expr_ e mb_a) = Expr (demote e) (demote mb_a)
+
+instance Demote Expression where
+  demote (Param_ s ty) = Param (demote s) (demote ty)
+  demote (IntLit_ k) = IntLit (demote k)
+  demote (StrLit_ s) = StrLit (demote s)
+  demote (Col_ c)    = Col (demote c)
+  demote (QualCol_ t c) = QualCol (demote t) (demote c)
+  demote (Equal_ e1 e2) = Equal (demote e1) (demote e2)
 
 
 
@@ -221,17 +309,19 @@ type family LookupResultColumns (rcs :: [ResultColumn]) (cols :: [Column]) :: [C
   LookupResultColumns ('Expr e (Just c) ': rcs) cols = (c ::: ExprType e cols) ': LookupResultColumns rcs cols
 
 type family ExprName e where
-  ExprName IntLit = "" -- ?
-  ExprName StrLit = "" -- ?
-  ExprName (Col c) = c
+  ExprName (Param _ _)   = "" -- ?
+  ExprName (IntLit _)    = "" -- ?
+  ExprName (StrLit _)    = "" -- ?
+  ExprName (Col c)       = c
   ExprName (QualCol _ c) = c
 
 type family ExprType e cols where
-  ExprType IntLit  _     = Int
-  ExprType StrLit  _     = String
-  ExprType (Col c) cols  = LookupColumn c cols
-  ExprType (QualCol _ c) cols = LookupColumn c cols -- TODO
-  ExprType (Equal e1 e2) _ = Bool
+  ExprType (Param _ ty)  _     = ty
+  ExprType (IntLit _)    _     = Int
+  ExprType (StrLit _)    _     = String
+  ExprType (Col c)       cols  = LookupColumn c cols
+  ExprType (QualCol _ c) cols  = LookupColumn c cols -- TODO
+  ExprType (Equal e1 e2) _     = Bool
 
 type family LookupTable (table :: TableName) (db :: Database) :: [Column] where
   LookupTable table '[] = TypeError (Text "Table " :<>: ShowType table :<>: Text " missing")
@@ -273,8 +363,9 @@ type family ValidWhere (wc :: WhereClause) (cols :: [Column])  :: Constraint whe
   ValidWhere (Just e) cols = ValidExpr e cols
 
 type family ValidExpr (e :: Expression) (cols :: [Column])  :: Constraint where
-  ValidExpr IntLit  _ = ()
-  ValidExpr StrLit  _ = ()
+  ValidExpr (Param _ _) _ = ()
+  ValidExpr (IntLit _)  _ = ()
+  ValidExpr (StrLit _)  _ = ()
   ValidExpr (Col c) cols = ValidCol c cols
   ValidExpr (QualCol _ c) cols = ValidCol c cols -- TODO
   ValidExpr (Equal e1 e2) cols = (ValidExpr e1 cols, ValidExpr e2 cols, ExprType e1 cols ~ ExprType e2 cols)
@@ -316,6 +407,10 @@ instance (SingI [Column] cols, AllColumnTypes PG.FromField cols) => PG.FromRow (
               Nil_            -> pure Nil
               Column_ _ :> xs -> Cons <$> PG.field <*> withSing xs PG.fromRow
 
+instance AllColumnTypes PG.ToField cols => PG.ToRow (Record cols) where
+  toRow Nil = []
+  toRow (Cons x xs) = PG.toField x : PG.toRow xs
+
 
 -- Fake wrapper monad for issuing queries
 
@@ -325,27 +420,35 @@ runDb :: Db db a -> IO a
 runDb db = do conn <- PG.connectPostgreSQL "host='localhost' dbname='mydatabase' password='womblewomble'"
               unDb db conn <* PG.close conn
 
-select :: forall db q cols . (ValidQuery db q, cols ~ QueryColumnsDB db q, AllColumnTypes PG.FromField cols, SingI [Column] cols) => Sing SelectQuery q -> Db db [Record (QueryColumnsDB db q)]
-select s = Db $ \ conn -> do print (toQuery s)
-                             PG.query_ conn (fromString (toQuery s))
+select :: forall db q cols . ( ValidQuery db q
+                             , cols ~ QueryColumnsDB db q
+                             , AllColumnTypes PG.FromField cols
+                             , AllColumnTypes Show (Params q)
+                             , AllColumnTypes PG.ToField (Params q)
+                             , SingI [Column] cols)
+            => Sing SelectQuery q -> Record (Params q) -> Db db [Record (QueryColumnsDB db q)]
+select s p = Db $ \ conn -> do let q = toQuery (demote s)
+                               print q
+                               print p
+                               PG.query conn (fromString q) p
 
 
 
 -- Examples
 
+e0 = Select_ (Star_ :> Nil_) (From_ #users) Nothing_
+
 type ExampleQuery = Select '[ Expr (Col "name") {- AS -} (Just "foo")
-                            , Expr IntLit Nothing
+                            , Expr (IntLit 5) Nothing
                             , Star
                             ]
                             (Join (From "users") (From "posts") (Using '["user_id"]))
-                   {- WHERE -} (Just (Col "name" `Equal` StrLit))
-
-e0 = Select_ (Star_ :> Nil_) (From_ #users) Nothing_
+                   {- WHERE -} (Just (Col "name" `Equal` StrLit "moo"))
 
 e1 :: Sing SelectQuery ExampleQuery
-e1 = Select_ (Expr_ (Col_ #name) (Just_ #foo) :> Expr_ (IntLit_ 5) Nothing_ :> Star_ :> Nil_)
+e1 = Select_ (Expr_ (Col_ #name) (Just_ #foo) :> Expr_ (IntLit_ sing) Nothing_ :> Star_ :> Nil_)
             (Join_ (From_ #users) (From_ #posts) (Using_ (#user_id :> Nil_)))
-            (Just_ (Col_ #name `Equal_` StrLit_ "moo"))
+            (Just_ (Col_ #name `Equal_` StrLit_ #moo))
 
 e2 = Select_ (Star_ :> Nil_)
              (Join_ (From_ #posts) (From_ #users `As_` #blah)
@@ -355,6 +458,8 @@ e2 = Select_ (Star_ :> Nil_)
 e3 = Select_ (Expr_ (QualCol_ #foo #baf) Nothing_ :> Nil_)
              (Join_ (From_ #users `As_` #bar) (From_ #posts `As_` #foo) Cross_)
              Nothing_
+
+e4 = Select_ (Star_ :> Nil_) (From_ #users) (Just_ (Col_ #name `Equal_` Param_ #name undefined))
 
 type MySchema = '[ "users" := '[ "user_id" ::: Int
                                , "name"    ::: String
@@ -370,10 +475,11 @@ type MySchema = '[ "users" := '[ "user_id" ::: Int
 type Example = QueryColumnsDB MySchema ExampleQuery
 
 
-go e = runDb (select @MySchema e)
+go e p = runDb (select @MySchema e p)
 
 main :: IO ()
-main = do print =<< go e0
-          print =<< go e1
-          print =<< go e2
-          print =<< go e3
+main = do print =<< go e0 Nil
+          print =<< go e1 Nil
+          print =<< go e2 Nil
+          print =<< go e3 Nil
+          print =<< go e4 (Cons "adam" Nil)
