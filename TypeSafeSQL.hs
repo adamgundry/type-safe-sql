@@ -402,15 +402,17 @@ data Record (cols :: [Column]) where
   Cons :: a -> Record cols -> Record ((colname ::: a) ': cols)
 deriving instance AllColumnTypes Show cols => Show (Record cols)
 
-instance (SingI [Column] cols, AllColumnTypes PG.FromField cols) => PG.FromRow (Record cols) where
-  fromRow = case sing :: Sing [Column] cols of
-              Nil_            -> pure Nil
-              Column_ _ :> xs -> Cons <$> PG.field <*> withSing xs PG.fromRow
+instance PG.FromRow (Record '[]) where
+  fromRow = pure Nil
 
-instance AllColumnTypes PG.ToField cols => PG.ToRow (Record cols) where
+instance (PG.FromField ty, PG.FromRow (Record cols)) => PG.FromRow (Record ((colname '::: ty) ': cols)) where
+  fromRow = Cons <$> PG.field <*> PG.fromRow
+
+instance PG.ToRow (Record '[]) where
   toRow Nil = []
-  toRow (Cons x xs) = PG.toField x : PG.toRow xs
 
+instance (PG.ToField ty, PG.ToRow (Record cols)) => PG.ToRow (Record ((colname '::: ty) ': cols)) where
+  toRow (Cons x xs) = PG.toField x : PG.toRow xs
 
 -- Fake wrapper monad for issuing queries
 
@@ -422,10 +424,10 @@ runDb db = do conn <- PG.connectPostgreSQL "host='localhost' dbname='mydatabase'
 
 select :: forall db q cols . ( ValidQuery db q
                              , cols ~ QueryColumnsDB db q
-                             , AllColumnTypes PG.FromField cols
-                             , AllColumnTypes Show (Params q)
-                             , AllColumnTypes PG.ToField (Params q)
-                             , SingI [Column] cols)
+                             , PG.ToRow (Record (Params q))
+                             , PG.FromRow (Record cols)
+                             , Show (Record (Params q))
+                             )
             => Sing SelectQuery q -> Record (Params q) -> Db db [Record (QueryColumnsDB db q)]
 select s p = Db $ \ conn -> do let q = toQuery (demote s)
                                print q
