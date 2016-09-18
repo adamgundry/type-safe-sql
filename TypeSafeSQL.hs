@@ -1,7 +1,9 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE InstanceSigs #-}
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedLabels #-}
@@ -9,6 +11,7 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeInType #-}
@@ -20,6 +23,8 @@
 module TypeSafeSQL where
 
 import qualified Data.ByteString as BS
+import qualified Data.Singletons as S
+import qualified Data.Singletons.TH as S
 import qualified Database.PostgreSQL.Simple as PG
 import qualified Database.PostgreSQL.Simple.FromRow as PG
 import qualified Database.PostgreSQL.Simple.FromField as PG
@@ -34,29 +39,126 @@ import GHC.TypeLits
 import Unsafe.Coerce
 
 
--- Schema representation
+stringToSymbol :: String -> Symbol
+stringToSymbol = unsafeCoerce
 
-type Database   = [Table]
-data Table      = TableName := [Column]
-data Column     = ColumnName ::: Type
-type TableName  = Symbol
-type ColumnName = Symbol
+symbolToString :: Symbol -> String
+symbolToString = unsafeCoerce
+
+integerToNat :: Integer -> Nat
+integerToNat = unsafeCoerce
+
+natToInteger :: Nat -> Integer
+natToInteger = unsafeCoerce
 
 
--- Syntax of queries at type level
+newtype TableName = T Symbol
 
-data SelectQuery = Select [ResultColumn] TableExpr WhereClause
+{-
+newtype ColumnName = C Symbol
+newtype StrSymbol = S Symbol
+newtype ParamName = P Symbol
+-}
 
-data TableExpr = From TableName
-               | Join TableExpr TableExpr JoinType
-               | As TableExpr TableName
-data JoinType = Cross | On Expression | Using [ColumnName]
+type ColumnName = TableName
+type StrSymbol = TableName
+type ParamName = TableName
 
-data ResultColumn = Star | Expr Expression AsClause
+type C = T
+type S = T
+type P = T
 
+data instance S.Sing (t :: TableName) where
+  STableName :: S.Sing s -> S.Sing (T s)
+
+instance KnownSymbol s => S.SingI (T s) where
+  sing = STableName S.sing
+
+instance S.SingKind TableName where
+  type DemoteRep TableName = TableName
+
+  fromSing :: S.Sing (a :: TableName) -> S.DemoteRep TableName
+  fromSing (STableName s) = T (stringToSymbol (S.fromSing s))
+  toSing (T s) = case someSymbolVal (symbolToString s) of
+                   SomeSymbol (_ :: S.Proxy t) -> S.SomeSing (STableName (S.sing :: S.Sing t))
+
+
+data instance S.Sing (a :: Type) where
+  SType :: Type -> S.Sing (a :: Type)
+
+instance S.SingKind Type where
+  type DemoteRep Type = Type
+  fromSing (SType t) = t
+  toSing t = S.SomeSing (SType t)
+
+
+data IntegerLit = Pos Nat
+                | Neg Nat
+
+instance Eq   IntegerLit where
+  x == y = toInteger x == toInteger y
+
+instance Ord  IntegerLit
+instance Num  IntegerLit
+instance Real IntegerLit
+instance Enum IntegerLit
+
+instance Integral IntegerLit where
+  toInteger (Pos n) = natToInteger n
+  toInteger (Neg n) = - natToInteger n
+
+data instance S.Sing (i :: IntegerLit) where
+  SPos :: S.Sing n -> S.Sing (Pos n)
+  SNeg :: S.Sing n -> S.Sing (Neg n)
+
+instance S.SingKind IntegerLit where
+  type DemoteRep IntegerLit = IntegerLit
+  fromSing (SPos n) = Pos (integerToNat (S.fromSing n))
+  fromSing (SNeg n) = Neg (integerToNat (S.fromSing n))
+  toSing (Pos n) = case someNatVal (natToInteger n) of
+                     Just (SomeNat (_ :: S.Proxy n)) -> S.SomeSing (SPos (S.sing :: S.Sing n))
+                     Nothing -> error "erk"
+  toSing (Neg n) = case someNatVal (natToInteger n) of
+                     Just (SomeNat (_ :: S.Proxy n)) -> S.SomeSing (SNeg (S.sing :: S.Sing n))
+                     Nothing -> error "erk"
+
+instance KnownNat n => S.SingI (Pos n) where
+  sing = SPos S.sing
+
+instance KnownNat n => S.SingI (Neg n) where
+  sing = SNeg S.sing
+
+
+$(S.singletons [d|
+
+  -- Schema representation
+  data Table      = TableName := [Column]
+  data Column     = ColumnName ::: Type
+
+  -- Syntax of queries at type level
+  data Expression   = Param ParamName Type
+                    | IntLit IntegerLit
+                    | StrLit StrSymbol
+                    | Col ColumnName
+                    | QualCol TableName ColumnName
+                    | Equal Expression Expression
+
+  data JoinType = Cross | On Expression | Using [ColumnName]
+  data TableExpr = From TableName
+                 | Join TableExpr TableExpr JoinType
+                 | As TableExpr TableName
+ |])
+
+type CrossJoin te1 te2 = Join te1 te2 Cross
 type WhereClause  = Maybe Expression
 type AsClause     = Maybe ColumnName
-data Expression   = Param Symbol Type | IntLit Nat | StrLit Symbol | Col ColumnName | QualCol TableName ColumnName | Equal Expression Expression
+
+$(S.singletons [d|
+  data SelectQuery = Select [ResultColumn] TableExpr WhereClause
+  data ResultColumn = Star | Expr Expression AsClause
+ |])
+
+type Database   = [Table]
 
 
 type family Params (q :: k) :: [Column] where
@@ -73,26 +175,12 @@ type family Params (q :: k) :: [Column] where
   Params (Using _)            = '[]
   Params Star                 = '[]
   Params (Expr e _)           = Params e
-  Params (Param s ty)         = '[s ::: ty]
+  Params (Param (P s) ty)     = '[C s ::: ty]
   Params (IntLit _)           = '[]
   Params (StrLit _)           = '[]
   Params (Col _)              = '[]
   Params (QualCol _ _)        = '[]
   Params (Equal e1 e2)        = Params e1 ++ Params e2
-
-
-
-stringToSymbol :: String -> Symbol
-stringToSymbol = unsafeCoerce
-
-symbolToString :: Symbol -> String
-symbolToString = unsafeCoerce
-
-integerToNat :: Integer -> Nat
-integerToNat = unsafeCoerce
-
-natToInteger :: Nat -> Integer
-natToInteger = unsafeCoerce
 
 
 class ToQuery q where
@@ -109,6 +197,9 @@ instance ToQuery a => ToQuery [a] where
 
 instance ToQuery Symbol where
   toQuery = symbolToString
+
+instance ToQuery TableName where
+  toQuery (T s) = toQuery s
 
 instance ToQuery SelectQuery where
   toQuery (Select rcs te mb_w) = "SELECT " ++ toQuery rcs ++ " FROM " ++ toQuery te ++ maybeToQuery "WHERE" mb_w
@@ -127,139 +218,11 @@ instance ToQuery ResultColumn where
 
 instance ToQuery Expression where
   toQuery (Param _ _)   = "?"
-  toQuery (IntLit i)    = show (natToInteger i)
-  toQuery (StrLit s)    = "'" ++ symbolToString s ++ "'"
+  toQuery (IntLit i)    = show (toInteger i)
+  toQuery (StrLit (T s))  = "'" ++ symbolToString s ++ "'"
   toQuery (Col c)       = toQuery c
   toQuery (QualCol t c) = toQuery t ++ "." ++ toQuery c
   toQuery (Equal e1 e2) = toQuery e1 ++ " = " ++ toQuery e2
-
-
--- General-purpose singletons
-
-data family Sing k :: k -> Type
-data instance Sing [k] xs where
-  Nil_ :: Sing [k] '[]
-  (:>) :: Sing k x -> Sing [k] xs -> Sing [k] (x ': xs)
-infixr 5 :>
-data instance Sing (Maybe k) x where
-  Nothing_ :: Sing (Maybe k) Nothing
-  Just_    :: Sing k x -> Sing (Maybe k) (Just x)
-data instance Sing Symbol s where
-  Symbol :: KnownSymbol s => Proxy# s -> Sing Symbol s
-data instance Sing Nat n where
-  Nat :: KnownNat n => Proxy# n -> Sing Nat n
-data instance Sing Type ty where
-  Type_ :: Type -> Sing Type ty
-
-instance (s ~ x, KnownSymbol s) => IsLabel x (Sing Symbol s) where
-  fromLabel = Symbol
-
-
--- Singletons for schema
-
-data instance Sing Table t where
-  (:==) :: Sing TableName tname -> Sing [Column] cols -> Sing Table (tname := cols)
-data instance Sing Column x where
-  Column_ :: Sing ColumnName colname -> Sing Column (colname ::: ty)
-
-
--- Singletons for representing queries at value level
-
-data instance Sing SelectQuery q where
-  Select_ :: Sing [ResultColumn] rcs -> Sing TableExpr te -> Sing WhereClause wc
-          -> Sing SelectQuery (Select rcs te wc)
-data instance Sing ResultColumn rc where
-  Star_ :: Sing ResultColumn Star
-  Expr_ :: Sing Expression e -> Sing AsClause a -> Sing ResultColumn (Expr e a)
-data instance Sing TableExpr te where
-  From_ :: Sing TableName t -> Sing TableExpr (From t)
-  Join_ :: Sing TableExpr te1 -> Sing TableExpr te2 -> Sing JoinType j -> Sing TableExpr (Join te1 te2 j)
-  As_ :: Sing TableExpr te -> Sing TableName t -> Sing TableExpr (As te t)
-data instance Sing JoinType j where
-  Cross_ :: Sing JoinType Cross
-  On_    :: Sing Expression e -> Sing JoinType (On e)
-  Using_ :: Sing [ColumnName] cols -> Sing JoinType (Using cols)
-data instance Sing Expression e where
-  Param_   :: Sing Symbol s -> Sing Type ty -> Sing Expression (Param s ty)
-  IntLit_  :: Sing Nat i -> Sing Expression (IntLit i)
-  StrLit_  :: Sing Symbol s -> Sing Expression (StrLit s)
-  Col_     :: Sing ColumnName c -> Sing Expression (Col c)
-  QualCol_ :: Sing TableName t -> Sing ColumnName c -> Sing Expression (QualCol t c)
-  Equal_   :: Sing Expression e1 -> Sing Expression e2 -> Sing Expression (Equal e1 e2)
-
-
--- Implicit singletons
-
-class SingI k (x :: k) where
-  sing :: Sing k x
-
-newtype T k (x :: k) t = MkT (SingI k x => t)
-
-withSing :: forall k x t . Sing k x -> (SingI k x => t) -> t
-withSing d f = unsafeCoerce (MkT @k @x @t f) d
-
-instance SingI [k] '[] where
-  sing = Nil_
-
-instance (SingI k x, SingI [k] xs) => SingI [k] (x ': xs) where
-  sing = sing :> sing
-
-instance KnownSymbol s => SingI Symbol s where
-  sing = Symbol proxy#
-
-instance KnownNat n => SingI Nat n where
-  sing = Nat proxy#
-
-instance (SingI ColumnName colname) => SingI Column (colname ::: ty) where
-  sing = Column_ sing
-
-
--- Converting singleton queries back to strings
-
-class Demote k where
-  demote :: Sing k e -> k
-
-instance Demote Symbol where
-  demote (Symbol p) = stringToSymbol (symbolVal' p)
-
-instance Demote Nat where
-  demote (Nat p) = integerToNat (natVal' p)
-
-instance Demote Type where
-  demote (Type_ t) = t
-
-instance Demote k => Demote (Maybe k) where
-  demote Nothing_ = Nothing
-  demote (Just_ x) = Just (demote x)
-
-instance Demote k => Demote [k] where
-  demote Nil_        = []
-  demote (x :> xs)   = demote x : demote xs
-
-instance Demote SelectQuery where
-  demote (Select_ rcs t mb_w) = Select (demote rcs) (demote t) (demote mb_w)
-
-instance Demote TableExpr where
-  demote (From_ t) = From (demote t)
-  demote (Join_ te1 te2 j) = Join (demote te1) (demote te2) (demote j)
-  demote (As_ te t) = As (demote te) (demote t)
-
-instance Demote JoinType where
-  demote Cross_ = Cross
-  demote (On_ e) = On (demote e)
-  demote (Using_ cols) = Using (demote cols)
-
-instance Demote ResultColumn where
-  demote Star_ = Star -- "*"
-  demote (Expr_ e mb_a) = Expr (demote e) (demote mb_a)
-
-instance Demote Expression where
-  demote (Param_ s ty) = Param (demote s) (demote ty)
-  demote (IntLit_ k) = IntLit (demote k)
-  demote (StrLit_ s) = StrLit (demote s)
-  demote (Col_ c)    = Col (demote c)
-  demote (QualCol_ t c) = QualCol (demote t) (demote c)
-  demote (Equal_ e1 e2) = Equal (demote e1) (demote e2)
 
 
 
@@ -308,10 +271,10 @@ type family LookupResultColumns (rcs :: [ResultColumn]) (cols :: [Column]) :: [C
   LookupResultColumns ('Expr e Nothing  ': rcs) cols = (ExprName e ::: ExprType e cols) ': LookupResultColumns rcs cols
   LookupResultColumns ('Expr e (Just c) ': rcs) cols = (c ::: ExprType e cols) ': LookupResultColumns rcs cols
 
-type family ExprName e where
-  ExprName (Param _ _)   = "" -- ?
-  ExprName (IntLit _)    = "" -- ?
-  ExprName (StrLit _)    = "" -- ?
+type family ExprName e :: ColumnName where
+  ExprName (Param _ _)   = C "" -- ?
+  ExprName (IntLit _)    = C "" -- ?
+  ExprName (StrLit _)    = C "" -- ?
   ExprName (Col c)       = c
   ExprName (QualCol _ c) = c
 
@@ -427,61 +390,78 @@ select :: forall db q cols . ( ValidQuery db q
                              , PG.ToRow (Record (Params q))
                              , PG.FromRow (Record cols)
                              , Show (Record (Params q))
+                             , S.SingI q
                              )
-            => Sing SelectQuery q -> Record (Params q) -> Db db [Record (QueryColumnsDB db q)]
-select s p = Db $ \ conn -> do let q = toQuery (demote s)
-                               print q
-                               print p
-                               PG.query conn (fromString q) p
+            => Record (Params q) -> Db db [Record (QueryColumnsDB db q)]
+select p = Db $ \ conn -> do let q = toQuery (S.fromSing (S.sing :: S.Sing q))
+                             print q
+                             print p
+                             PG.query conn (fromString q) p
 
 
 
 -- Examples
 
-e0 = Select_ (Star_ :> Nil_) (From_ #users) Nothing_
+type E0 = Select '[Star] (From (T "users")) Nothing
+-- e0 = Select_ (Star_ :> Nil_) (From_ #users) Nothing_
 
-type ExampleQuery = Select '[ Expr (Col "name") {- AS -} (Just "foo")
-                            , Expr (IntLit 5) Nothing
+type E1 = Select '[ Expr (Col (C "name")) {- AS -} (Just (C "foo"))
+                            , Expr (IntLit (Pos 5)) Nothing
                             , Star
                             ]
-                            (Join (From "users") (From "posts") (Using '["user_id"]))
-                   {- WHERE -} (Just (Col "name" `Equal` StrLit "moo"))
-
-e1 :: Sing SelectQuery ExampleQuery
+                            (Join (From (T "users")) (From (T "posts")) (Using '[C "user_id"]))
+                   {- WHERE -} (Just (Col (C "name") `Equal` StrLit (S "moo")))
+{-
+e1 :: Sing SelectQuery E1
 e1 = Select_ (Expr_ (Col_ #name) (Just_ #foo) :> Expr_ (IntLit_ sing) Nothing_ :> Star_ :> Nil_)
             (Join_ (From_ #users) (From_ #posts) (Using_ (#user_id :> Nil_)))
             (Just_ (Col_ #name `Equal_` StrLit_ #moo))
+-}
 
+type E2 = Select '[Star] (Join (From (T "posts")) (From (T "users") `As` T "blah") (On (QualCol (T "blah") (C "user_id") `Equal` QualCol (T "posts") (C "user_id")))) Nothing
+{-
 e2 = Select_ (Star_ :> Nil_)
              (Join_ (From_ #posts) (From_ #users `As_` #blah)
                     (On_ (QualCol_ #blah #user_id `Equal_` QualCol_ #posts #user_id)))
              Nothing_
+-}
 
+type E3 = Select '[Expr (QualCol (T "foo") (C "baf")) Nothing]
+                 ((From (T "users") `As` T "bar") `CrossJoin` (From (T "posts") `As` T "foo"))
+                 Nothing
+{-
 e3 = Select_ (Expr_ (QualCol_ #foo #baf) Nothing_ :> Nil_)
              (Join_ (From_ #users `As_` #bar) (From_ #posts `As_` #foo) Cross_)
              Nothing_
+-}
 
-e4 = Select_ (Star_ :> Nil_) (From_ #users) (Just_ (Col_ #name `Equal_` Param_ #name undefined))
+-- type E4 = Select '[Star] (From (T "users")) (Just (Col (C "name") `Equal` Param (P "name") String))
+-- e4 = Select_ (Star_ :> Nil_) (From_ #users) (Just_ (Col_ #name `Equal_` Param_ #name undefined))
 
-type MySchema = '[ "users" := '[ "user_id" ::: Int
-                               , "name"    ::: String
-                               , "baf"     ::: Bool
-                               ]
-                 , "posts" := '[ "post_id" ::: Int
-                               , "user_id" ::: Int
-                               , "message" ::: String
-                               , "baf"     ::: Int
-                               ]
+type MySchema = '[ T "users" := '[ C "user_id" ::: Int
+                                 , C "name"    ::: String
+                                 , C "baf"     ::: Bool
+                                 ]
+                 , T "posts" := '[ C "post_id" ::: Int
+                                 , C "user_id" ::: Int
+                                 , C "message" ::: String
+                                 , C "baf"     ::: Int
+                                 ]
                  ]
 
-type Example = QueryColumnsDB MySchema ExampleQuery
-
-
-go e p = runDb (select @MySchema e p)
+go :: forall q cols . ( ValidQuery MySchema q
+                      , cols ~ QueryColumnsDB MySchema q
+                      , PG.ToRow (Record (Params q))
+                      , PG.FromRow (Record cols)
+                      , Show (Record (Params q))
+                      , S.SingI q
+                      )
+        => Record (Params q) -> IO [Record (QueryColumnsDB MySchema q)]
+go p = runDb (select @MySchema @q p)
 
 main :: IO ()
-main = do print =<< go e0 Nil
-          print =<< go e1 Nil
-          print =<< go e2 Nil
-          print =<< go e3 Nil
-          print =<< go e4 (Cons "adam" Nil)
+main = do print =<< go @E0 Nil
+          print =<< go @E1 Nil
+          print =<< go @E2 Nil
+          print =<< go @E3 Nil
+--           print =<< go @E4 (Cons "adam" Nil)
